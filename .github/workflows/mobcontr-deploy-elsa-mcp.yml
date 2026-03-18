@@ -1,0 +1,227 @@
+name: Mobile Contract - Deploy MCP Elsa
+
+run-name: 'Mobile Contract MCP Elsa → ${{ github.event.inputs.environment || github.ref_name }} (#${{ github.run_number }})'
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - poc
+          - test
+          - staging
+          - prod
+        default: poc
+      version:
+        description: 'Image version tag'
+        required: false
+        type: string
+        default: 'latest'
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: string
+      version:
+        description: 'Image version tag'
+        required: false
+        type: string
+        default: 'latest'
+      skip_acr_access_toggle:
+        description: 'Skip ACR public access enable/disable (used when called from deploy-all)'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+      GH_PAT_MODULES:
+        required: true
+
+env:
+  AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID || secrets.AZURE_CLIENT_ID }}
+  AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID || secrets.AZURE_TENANT_ID }}
+  AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID || secrets.AZURE_SUBSCRIPTION_ID }}
+  ENV_NAME: ${{ github.event.inputs.environment || github.ref_name }}
+  IMAGE_NAME: mobcontr-mcp-elsa
+  DOCKERFILE_PATH: af_agentcell_004/mcps/elsa-mcp/Dockerfile
+  BUILD_CONTEXT: .
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_TF_RG_NAME || secrets.AZURE_TF_RG_NAME }}
+  CONTAINER_APP_MCP_ELSA: "ca-mcp-elsa-mobcontr-${{ github.event.inputs.environment || github.ref_name }}-gwc"
+  CONTAINER_REGISTRY: "acrmobcontr${{ github.event.inputs.environment || github.ref_name }}.azurecr.io"
+  REGISTRY_NAME: "acrmobcontr${{ github.event.inputs.environment || github.ref_name }}"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || github.event.inputs.environment || github.ref_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          path: af_agentcell_004
+
+      - name: Checkout SDK repo
+        uses: actions/checkout@v4
+        with:
+          repository: bayer-int/agentic_ai_sdk
+          path: agentic_ai_sdk
+          token: ${{ secrets.GH_PAT_MODULES }}
+
+      - name: Set version tag
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ] && [ "${{ github.event.inputs.version }}" != "latest" ]; then
+            VERSION_TAG="${{ github.event.inputs.version }}"
+            echo "Using manual version: ${VERSION_TAG}"
+          else
+            SHORT_SHA="${GITHUB_SHA::7}"
+            VERSION_TAG="$(date +%Y.%m.%d)-${SHORT_SHA}-${{ github.run_id }}"
+            echo "Generated version: ${VERSION_TAG}"
+          fi
+          echo "VERSION=${VERSION_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Export ARM credentials for Terraform
+        shell: bash
+        env:
+          ARM_CLIENT_ID: ${{ env.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ env.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ env.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: "true"
+        run: |
+          {
+            echo "ARM_CLIENT_ID=$ARM_CLIENT_ID"
+            echo "ARM_TENANT_ID=$ARM_TENANT_ID"
+            echo "ARM_SUBSCRIPTION_ID=$ARM_SUBSCRIPTION_ID"
+            echo "ARM_USE_OIDC=$ARM_USE_OIDC"
+          } >> "$GITHUB_ENV"
+
+      - name: Set Azure Subscription
+        run: |
+          az account set --subscription "${{ env.AZURE_SUBSCRIPTION_ID }}"
+          az account show
+
+      - name: Validate Azure Targets
+        run: |
+          set -e
+          echo "AZURE_SUBSCRIPTION_ID=${{ env.AZURE_SUBSCRIPTION_ID }}"
+          echo "AZURE_RESOURCE_GROUP=${{ env.AZURE_RESOURCE_GROUP }}"
+          echo "CONTAINER_APP_MCP_ELSA=${{ env.CONTAINER_APP_MCP_ELSA }}"
+          echo "CONTAINER_REGISTRY=${{ env.CONTAINER_REGISTRY }}"
+          if [ -z "${{ env.CONTAINER_APP_MCP_ELSA }}" ]; then echo "Missing CONTAINER_APP_MCP_ELSA"; exit 1; fi
+          if [ -z "${{ env.AZURE_RESOURCE_GROUP }}" ]; then echo "Missing AZURE_RESOURCE_GROUP"; exit 1; fi
+          az group show -n "${{ env.AZURE_RESOURCE_GROUP }}" 1>/dev/null
+          echo "Validating container app exists..."
+          az containerapp show \
+            --name "${{ env.CONTAINER_APP_MCP_ELSA }}" \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --subscription "${{ env.AZURE_SUBSCRIPTION_ID }}" -o table
+
+      - name: Temporarily Enable ACR Public Access
+        if: ${{ inputs.skip_acr_access_toggle != true }}
+        run: |
+          echo "Temporarily enabling public access for ACR build..."
+          az acr update \
+            --name "${{ env.REGISTRY_NAME }}" \
+            --public-network-enabled true \
+            --default-action Allow
+          echo "Waiting for ACR configuration to propagate..."
+          for i in {1..12}; do
+            sleep 10
+            STATUS=$(az acr show --name "${{ env.REGISTRY_NAME }}" --query "publicNetworkAccess" -o tsv)
+            echo "Attempt $i: Public network access = $STATUS"
+            if [ "$STATUS" == "Enabled" ]; then
+              echo "✅ Public access confirmed enabled"
+              break
+            fi
+          done
+          sleep 15
+
+      - name: Unlock Latest Tag (if exists)
+        continue-on-error: true
+        run: |
+          az acr repository update \
+            --name "${{ env.REGISTRY_NAME }}" \
+            --image "${{ env.IMAGE_NAME }}:latest" \
+            --write-enabled true \
+            --delete-enabled true 2>/dev/null || echo "No existing latest tag to unlock"
+
+      - name: Build and Push Image with ACR Tasks
+        id: build
+        run: |
+          echo "Building image using ACR Tasks..."
+          echo "  Registry: ${{ env.REGISTRY_NAME }}"
+          echo "  Image: ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}"
+          az acr build \
+            --registry "${{ env.REGISTRY_NAME }}" \
+            --image "${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}" \
+            --image "${{ env.IMAGE_NAME }}:latest" \
+            --platform linux/amd64 \
+            --file "${{ env.DOCKERFILE_PATH }}" \
+            --secret-build-arg ARTIFACTORY_USER="${{ vars.ARTIFACTORY_USER }}" \
+            --secret-build-arg ARTIFACTORY_TOKEN="${{ secrets.ARTIFACTORY_TOKEN }}" \
+            --secret-build-arg GH_PAT_MODULES="${{ secrets.GH_PAT_MODULES }}" \
+            "${{ env.BUILD_CONTEXT }}"
+          echo "✅ Image built and pushed successfully"
+
+      - name: Disable ACR Public Access
+        if: false # Temporarily disabled - enable in production
+        run: |
+          echo "Disabling ACR public access..."
+          az acr update \
+            --name "${{ env.REGISTRY_NAME }}" \
+            --public-network-enabled false \
+            --default-action Deny
+          echo "✅ ACR public access disabled"
+
+      - name: Lock Version Tag (Make Immutable)
+        run: |
+          az acr repository update \
+            --name "${{ env.REGISTRY_NAME }}" \
+            --image "${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}" \
+            --write-enabled false \
+            --delete-enabled false
+
+      - name: Lock Latest Tag
+        run: |
+          az acr repository update \
+            --name "${{ env.REGISTRY_NAME }}" \
+            --image "${{ env.IMAGE_NAME }}:latest" \
+            --write-enabled false \
+            --delete-enabled false
+
+      - name: Update Container App with New Image
+        run: |
+          az containerapp revision copy \
+            --name "${{ env.CONTAINER_APP_MCP_ELSA }}" \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --image "${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}"
+
+      - name: Deployment Summary
+        run: |
+          echo "### Deployment Summary (MCP Elsa)" >> $GITHUB_STEP_SUMMARY
+          echo "- Environment: ${{ env.ENV_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Subscription: ${{ env.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Resource Group: ${{ env.AZURE_RESOURCE_GROUP }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Container App: ${{ env.CONTAINER_APP_MCP_ELSA }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: ${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}" >> $GITHUB_STEP_SUMMARY

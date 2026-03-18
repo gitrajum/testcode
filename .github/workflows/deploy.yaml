@@ -1,0 +1,132 @@
+# Main worflow that applies Terraform configuration from 'configuration' directory.
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  TERRAFORM_VERSION: ${{ vars.TERRAFORM_VERSION || '1.14.3' }}
+
+jobs:
+  deploy:
+    name: Deploy configuration
+    environment: ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    env:
+      ARM_USE_OIDC: true
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_CLI: false
+      TF_PLAN_FILE: ${{ github.sha }}.tfplan
+      ENVIRONMENT: ${{ inputs.environment }}
+      TF_RG_NAME: ${{ vars.AZURE_TF_RG_NAME }}
+      TF_BACKEND_NAME: ${{ vars.AZURE_TF_BACKEND_NAME }}
+      TF_VAR_azure_apim_sub_key: ${{ secrets.AZURE_APIM_SUB_KEY }}
+      TF_VAR_databricks_token: ${{ secrets.DATABRICKS_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.ORG_REPOS_INTERNAL_READ_ONLY }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install packages
+        shell: bash
+        working-directory: ./.github/workflows/scripts/
+        run: |
+          . install-terraform.sh && \
+          . install-git.sh
+
+      - name: Install Azure CLI
+        shell: bash
+        run: |
+          # Install Azure CLI for ACR access management
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl apt-transport-https lsb-release gnupg
+          sudo mkdir -p /etc/apt/keyrings
+          curl -sLS https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /etc/apt/keyrings/microsoft.gpg > /dev/null
+          sudo chmod go+r /etc/apt/keyrings/microsoft.gpg
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/azure-cli.list
+          sudo apt-get update
+          sudo apt-get install -y azure-cli
+          echo "✅ Azure CLI installed"
+
+      - name: Prepare
+        env:
+          GH_TOKEN: ${{ secrets.ORG_REPOS_INTERNAL_READ_ONLY }}
+        run: |
+          git config --global credential.helper 'store --file ~/.git-credentials'
+          git config --global url."https://token:${GH_TOKEN}@github.com/bayer-int".insteadOf https://github.com/bayer-int
+
+      - name: Terraform Init
+        working-directory: configuration
+        run: |
+          terraform init -upgrade \
+            -backend-config="resource_group_name=${TF_RG_NAME}" \
+            -backend-config="storage_account_name=${TF_BACKEND_NAME}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=${ENVIRONMENT}.tfstate"
+
+      - name: Terraform Plan
+        working-directory: configuration
+        run: |
+          terraform plan --var-file=${ENVIRONMENT}.terraform.tfvars -out=${TF_PLAN_FILE} -input=false
+
+          # Note: please either append additional variable values here, or manually create and use a .tfvars file.
+          # Further information: https://developer.hashicorp.com/terraform/language/values/variables#variables-on-the-command-line
+          # Do the same for the apply step.
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure ACR Public Access Enabled
+        shell: bash
+        run: |
+          # Container Apps needs ACR public access to pull images (no private endpoint configured)
+          echo "Ensuring ACR public access is enabled before Terraform apply..."
+
+          # Determine ACR name based on environment
+          ACR_NAME="acrmobcontr${{ vars.ENVIRONMENT }}"
+
+          echo "ACR Name: $ACR_NAME"
+
+          # Enable public network access
+          az acr update \
+            --name "$ACR_NAME" \
+            --public-network-enabled true \
+            --default-action Allow || echo "⚠️  ACR may not exist yet or already configured"
+
+          echo "✅ ACR public access ensured"
+
+      - name: Terraform Apply
+        working-directory: configuration
+        run: |
+          terraform apply ${TF_PLAN_FILE}
+
+      - name: Commit and Push Changes
+        working-directory: configuration
+        shell: bash
+        env:
+          GIT_USER_EMAIL: "github-actions[bot]@users.noreply.github.com"
+          GIT_USER_NAME: "GitHub Actions"
+        run: |
+          if [[ -f api-gateway/config.json ]] && [[ ! -z $(git status --porcelain | grep config.json) ]]; then
+            git config --global user.email "${GIT_USER_EMAIL}"
+            git config --global user.name "${GIT_USER_NAME}"
+            git add api-gateway/config.json
+            git commit -m "Add config.json (automated)"
+            git push
+          else
+            echo "Config file config.json for AnyPoint Exchange not changed or not found"
+          fi

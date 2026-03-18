@@ -1,0 +1,108 @@
+name: Build Container Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_directory:
+        required: false
+        description: "Path to Dockerfile which should be used for Docker Build pipeline. E.g. container_images"
+        default: container_images
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build_push_default_directory:
+    if: ${{ inputs.build_directory == null }}
+    runs-on: [external-k8s-v2]
+    env:
+      IMAGE_NAME: ${{ github.ref_name}}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check if Dockerfile is in default directory
+        working-directory: container_images
+        run: |
+          if [ -f Dockerfile ] ; then
+            echo "Dockerfile detected!"
+          else
+            echo "No Dockerfile present! Please create one in the default directory and run again or specify a different location!"
+            exit 1
+          fi
+
+      - name: Set metadata
+        id: meta
+        uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
+        with:
+          # list of Docker images to use as base name for tags
+          images: |
+            ${{ vars.FAWKES_JFROG_REPOSITORY_NAME }}/container_images/${{ env.IMAGE_NAME }}
+          # generate Docker tags based on the following events/attributes
+          tags: |
+            type=raw,value=${{ github.run_number }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Login to Artifactory
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ${{ vars.FAWKES_JFROG_REPOSITORY_NAME }}
+          username: ${{ vars.FAWKES_JFROG_USER_NAME }}
+          password: ${{ secrets.FAWKES_JFROG_USER_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: "{{defaultContext}}:container_images"
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  build_push_input_directory:
+    runs-on: [external-k8s-v2]
+    if: ${{ inputs.build_directory != null }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check if Dockerfile is in given directory
+        working-directory: container_images
+        run: |
+          if [ -f Dockerfile ] ; then
+            echo "Dockerfile detected!"
+          else
+            echo "No Dockerfile present! Please create one in the default directory and run again or specify a different location!"
+            exit 1
+          fi
+
+      - name: Set metadata
+        id: meta
+        uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
+        with:
+          # list of Docker images to use as base name for tags
+          images: |
+            ${{ vars.FAWKES_JFROG_REPOSITORY_NAME }}/${{ inputs.build_directory }}
+          # generate Docker tags based on the following events/attributes
+          tags: |
+            type=raw,value=${{ github.run_number }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Login to Artifactory
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ${{ vars.FAWKES_JFROG_REPOSITORY_NAME }}
+          username: ${{ vars.FAWKES_JFROG_USER_NAME }}
+          password: ${{ secrets.FAWKES_JFROG_USER_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: "{{defaultContext}}:${{ inputs.build_directory }}"
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

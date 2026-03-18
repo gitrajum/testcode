@@ -1,0 +1,477 @@
+# MobileContractAgent Configuration
+
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
+
+logging:
+  level: "INFO"
+
+# ============================================================================
+# GATEWAY CONFIGURATIONS
+# ============================================================================
+
+# LLM Gateway Configuration - Azure OpenAI
+llm:
+  provider: "azure_openai"
+
+  config:
+    endpoint: "${AZURE_OPENAI_ENDPOINT}"
+    deployment_name: "${AZURE_OPENAI_DEPLOYMENT_NAME:gpt-4o-deployment}"
+    api_version: "${AZURE_OPENAI_API_VERSION:2025-01-01-preview}"
+    use_managed_identity: false
+    api_key: "${AZURE_OPENAI_API_KEY}"
+    timeout: 600
+
+  caching:
+    enabled: true
+    ttl: 3600
+    backend: "memory"
+
+  rate_limiting:
+    enabled: true
+    requests_per_minute: 60
+    backend: "memory"
+
+  logging:
+    enabled: true
+    level: "INFO"
+    log_requests: true
+    log_responses: true
+
+  max_retries: 3
+
+# ============================================================================
+# OBSERVABILITY GATEWAY CONFIGURATION
+# ============================================================================
+
+# observability:
+#   provider: "azure_monitor"
+
+#   enable_sensitive_data: true
+
+#   azure_monitor:
+#     connection_string: "${APPLICATIONINSIGHTS_CONNECTION_STRING}"
+#     use_managed_identity: false
+
+#     service_name: "mobile-contract-agent"
+#     service_version: "0.1.0"
+#     deployment_environment: "development"
+
+#     export_interval_millis: 5000
+#     sampling_ratio: 1.0
+
+#     enable_traces: true
+#     enable_metrics: true
+#     enable_logs: true
+#     enable_live_metrics: false
+
+#     timeout: 10
+
+#   log_level: "INFO"
+
+# ============================================================================
+# EXECUTOR CONFIGURATION
+# ============================================================================
+
+executor:
+  type: "phased_orchestration"
+  streaming: true
+
+  agents:
+    - name: "main_agent"
+      model:
+        name: "${AZURE_OPENAI_DEPLOYMENT_NAME:gpt-4o-deployment}"
+        type: "chat"
+        max_tokens: 4096
+        temperature: 0.0
+
+      system_prompt: |
+        You are a Mobile Contract data processing agent.
+        Your task is to extract data from invoice PDFs, load employee data, and generate analysis reports in a structured multi-phase process.
+        Follow the instructions for each phase carefully and use the specified tools to complete your tasks.
+
+      tools:
+        - "invoice_pdf_to_tables"
+        - "load_databricks_employee_data"
+        - "generate_mobile_contract_reports"
+        # Phase communication tools
+        - "store_phase_result"
+        - "get_phase_result"
+        - "get_all_phase_results"
+        # File handling tools
+        - "download_file_from_url"
+        - "read_file"
+
+      # MCP tools - Load all tools from configured MCP servers
+      # mcp_tools:
+      #   - "mcp://email-mcp"  # All Email tools
+      #   - "mcp://sharepoint-mcp"  # All SharePoint tools
+
+  phases:
+    - name: "Data Extraction Phase"
+      agent: "main_agent"
+      number: 1
+      instructions: |
+        **Objective:** Call `invoice_pdf_to_tables` once with all provided PDF paths, plus the vendor and country the user selected in the UI.
+
+        **Step 1 — Extract metadata from the user message:**
+        - Look for a line that starts with `Vendor/Carrier:` → extract the vendor name (e.g. "vivo", "att", "verizon"). If missing or "Unknown", pass `vendor=null`.
+        - Look for a line that starts with `Country:` → extract the country name (e.g. "Brazil", "United States"). If missing or "Unknown", pass `country=null`.
+        - Look for a line that starts with `Max pages per PDF:` → extract the integer value (e.g. 40, -1). If missing, pass `max_pages=null`. A value of -1 means process all pages.
+
+        **Step 2 — Collect PDF paths:**
+        Build `pdf_paths` from:
+          - Lines matching `- <path>` under `PDF files:` in the user text
+          - Attachment `uri` values ending with `.pdf`
+        Ignore `.csv` files in this phase.
+
+        **Step 3 — Make exactly ONE tool call:**
+        ```
+        invoice_pdf_to_tables(
+            file_paths=<pdf_paths>,
+            vendor=<vendor extracted in step 1, or null>,
+            country=<country extracted in step 1, or null>,
+            max_pages=<max_pages extracted in step 1, or null>
+        )
+        ```
+        Do NOT call `invoice_pdf_to_tables` more than once in this phase.
+
+        **Completion:**
+        - On success, output JSON and `---PHASE_COMPLETE---`.
+        - On failure, output `---PHASE_FAILED: <reason>---`.
+
+        **Required Output JSON:**
+        {
+          "extraction_complete": true,
+          "total_pdfs_processed": <number>,
+          "total_records": <number>,
+          "pdf_filenames": [<string>],
+          "sqlite_tables": [<string>],
+          "output_files": [<string>],
+          "errors": [<string>]
+        }
+
+      phase_output:
+        type: "object"
+        required: ["extraction_complete", "total_pdfs_processed", "total_records", "pdf_filenames", "sqlite_tables"]
+        properties:
+          extraction_complete:
+            type: "boolean"
+            description: "Whether at least one PDF was extracted successfully"
+          total_pdfs_processed:
+            type: "integer"
+            description: "Number of PDF files processed in this phase (expected: 1)"
+          total_records:
+            type: "integer"
+            description: "Total number of MSISDN records extracted"
+          pdf_filenames:
+            type: "array"
+            items:
+              type: "string"
+            description: "List of processed PDF filenames (typically one item)"
+          sqlite_tables:
+            type: "array"
+            items:
+              type: "string"
+            description: "List of SQLite table names created (typically one item)"
+          output_files:
+            type: "array"
+            items:
+              type: "string"
+            description: "List of CSV file paths generated (typically one item)"
+          errors:
+            type: "array"
+            items:
+              type: "string"
+            description: "List of any errors encountered during processing"
+
+    - name: "Employee Data Loading Phase"
+      agent: "main_agent"
+      number: 2
+      instructions: |
+        **Objective:** Load employee wireless data from Databricks into the SQLite table `Employee_data`.
+
+        **Prerequisites:**
+        - Phase 1 must have completed successfully (invoice data from one or more PDFs already in SQLite)
+
+        **STEP 1:** Call `load_databricks_employee_data`:
+        ```
+        load_databricks_employee_data()
+        ```
+        Optionally pass `country_filter` if the user specified a country in their message.
+
+        **STEP 2:** Verify the tool response: success == true, employee_records > 0.
+
+        **STEP 3:** Output structured JSON:
+          - mapping_complete: true
+          - employee_records: <count>
+          - employee_table: "Employee_data"
+          - data_source: "databricks"
+
+        **STEP 4:** Output ---PHASE_COMPLETE---
+
+        If any step fails, output ---PHASE_FAILED: [specific error]---
+
+        **Important Notes:**
+        - Employee data is always loaded from Databricks (DATABRICKS_TOKEN env var must be configured)
+        - Phone numbers are automatically normalized during loading
+        - After completion, SQLite contains: N invoice tables + 1 Employee_data table
+
+      phase_output:
+        type: "object"
+        required: ["mapping_complete", "employee_records", "employee_table", "data_source"]
+        properties:
+          data_source:
+            type: "string"
+            enum: ["databricks"]
+            description: "Where the employee data came from — always 'databricks'"
+          mapping_complete:
+            type: "boolean"
+            description: "Whether employee data loading completed successfully"
+          employee_records:
+            type: "integer"
+            description: "Number of employee records loaded"
+          employee_table:
+            type: "string"
+            description: "Name of employee data table in SQLite"
+
+    - name: "Report Generation Phase"
+      agent: "main_agent"
+      number: 3
+      instructions: |
+        **Objective:** Generate comprehensive analysis reports from invoice and employee data.
+
+        **Prerequisites:**
+        - Phase 1 and Phase 2 must have completed successfully
+        - Both invoice tables (one or more from Phase 1) and Employee_data table exist in SQLite
+
+        **Steps:**
+        1. Verify Phase 1 completed using get_phase_result(1):
+           - Check that extraction_complete is true
+           - Confirm invoice data was loaded
+        2. Verify Phase 2 completed using get_phase_result(2):
+           - Check that mapping_complete is true
+           - Confirm employee data was loaded
+        3. Call generate_mobile_contract_reports tool with the country and vendor the user selected in the UI
+           - Pass exactly the same country and vendor values used when calling invoice_pdf_to_tables in Phase 1
+           - Example: generate_mobile_contract_reports(country="Germany", vendor="telekom")
+           - If country is unknown or was not specified, omit the parameter (defaults to US normalisation)
+           - If vendor is unknown or was not specified, omit the parameter
+        4. The tool will:
+           - Automatically find ALL invoice tables in SQLite (from all PDFs in Phase 1)
+           - Consolidate data from all invoice tables for comprehensive analysis
+           - Analyze both invoice and employee tables in SQLite
+           - Detect zero usage users across all invoices
+           - Find invoice-only users (not in employee records)
+           - Identify fraud cases (inactive employees with usage)
+           - Detect employee-only users (not in any invoice)
+           - Calculate cost savings opportunities
+           - Generate Excel report with multiple sheets
+           - Save JSON summary with savings calculations
+        5. Check the tool response:
+           - Verify success is true
+           - Extract total_issues count
+           - Extract monthly_savings and annual_savings
+           - Get breakdown by category (zero_usage, invoice_only, fraud_cases)
+        6. If successful, output structured JSON with:
+           - reports_generated: true
+           - total_issues: <count from tool>
+           - monthly_savings: <amount from tool>
+           - annual_savings: <amount from tool>
+           - categories: <breakdown from tool>
+           - output_dir: <directory from tool>
+           - excel_file: <filename from tool>
+        7. Output ---PHASE_COMPLETE---
+        8. If any step fails, output ---PHASE_FAILED: [specific error]---
+
+        **Important Notes:**
+        - This phase requires both Phase 1 and Phase 2 data to be in SQLite
+        - The tool automatically consolidates ALL invoice tables (if multiple PDFs were processed)
+        - Analysis covers all months/invoices from Phase 1
+        - Reports are saved to 'output/' directory
+        - Excel file contains multiple sheets (Zero Usage, Invoice Only, Fraud Cases, Employee Only)
+        - JSON summary file contains detailed savings calculations
+
+      phase_output:
+        type: "object"
+        required: ["reports_generated", "total_issues", "monthly_savings", "annual_savings"]
+        properties:
+          reports_generated:
+            type: "boolean"
+            description: "Whether reports were successfully generated"
+          total_issues:
+            type: "integer"
+            description: "Total number of optimization opportunities found"
+          monthly_savings:
+            type: "number"
+            description: "Estimated monthly savings in dollars"
+          annual_savings:
+            type: "number"
+            description: "Estimated annual savings in dollars"
+          total_cost:
+            type: "number"
+            description: "Total monthly cost of identified issues"
+          categories:
+            type: "object"
+            description: "Breakdown by category (zero_usage, invoice_only, fraud_cases)"
+          output_dir:
+            type: "string"
+            description: "Directory where reports were saved"
+          excel_file:
+            type: "string"
+            description: "Name of generated Excel report file"
+
+    # - name: "Email Success Phase"
+    #   agent: "main_agent"
+    #   number: 4
+    #   instructions: |
+    #     **Objective:** Send simple success notification email.
+
+    #     **Steps:**
+    #     1. Verify Phase 3 completed using get_phase_result(3)
+    #     2. If Phase 3 is not complete, output ---PHASE_FAILED: Previous phase did not complete---
+    #     3. Prepare simple email:
+    #        Subject: "Mobile Contract Analysis Complete"
+    #        Content:
+    #        "Hello,\n\n"
+    #        "Mobile contract analysis has been completed successfully.\n\n"
+    #        "All phases have finished processing:\n"
+    #        "- PDF data extraction\n"
+    #        "- Employee data loading\n"
+    #        "- Report generation\n\n"
+    #        "Best regards,\n"
+    #        "Mobile Contract Agent"
+    #     4. Call send_email tool with these parameters:
+    #        - recipient: "jeel.soni@bayer.com"
+    #        - subject: "Mobile Contract Analysis Complete"
+    #        - content: (content from step 3)
+    #     5. Check the send_email response - if success is true, output ---PHASE_COMPLETE---
+    #     6. If any step fails, output ---PHASE_FAILED: [specific error]---
+
+    #   phase_output:
+    #     type: "object"
+    #     required: ["email_sent", "email_recipient", "email_subject"]
+    #     properties:
+    #       email_sent:
+    #         type: "boolean"
+    #         description: "Whether success email was sent"
+    #       email_recipient:
+    #         type: "string"
+    #         description: "Email address of the recipient"
+    #       email_subject:
+    #         type: "string"
+    #         description: "Subject line of the email"
+    #       completion_timestamp:
+    #         type: "string"
+    #         description: "Timestamp when email was sent"
+
+# ============================================================================
+# MCP SERVER CONFIGURATION (Optional)
+# ============================================================================
+
+# Model Context Protocol (MCP) server configuration for extending agents with custom tools
+# mcp:
+#   enabled: true  # Enable MCP integration
+#   servers:
+#     - name: "email-mcp"
+#       description: "Azure Communication Services email functionality"
+#       transport: "http"
+#       endpoint: "${EMAIL_MCP_ENDPOINT}"
+#       use_user_token_passthrough: "${EMAIL_MCP_USE_USER_TOKEN:false}"
+#       use_managed_identity: "${EMAIL_MCP_USE_MANAGED_IDENTITY:false}"
+#       audience: "${EMAIL_MCP_AUDIENCE}"
+
+    # - name: "sharepoint-mcp"
+    #   description: "Microsoft SharePoint document access via Graph API"
+    #   transport: "http"
+    #   endpoint: "${SHAREPOINT_MCP_ENDPOINT:}"
+    #   use_user_token_passthrough: "${SHAREPOINT_MCP_USE_USER_TOKEN:false}"  # Set to true when accessed via UI
+    #   use_managed_identity: "${SHAREPOINT_MCP_USE_MANAGED_IDENTITY:true}"  # Try managed identity for local dev
+    #   managed_identity_client_id: "${MANAGED_IDENTITY_CLIENT_ID}"
+    #   audience: "${SHAREPOINT_MCP_AUDIENCE}"
+    # Example 1: Service authentication - managed identity (agent's identity)
+    # - name: "analytics-mcp"
+    #   description: "Analytics MCP server with custom data tools"
+    #   transport: "http"
+    #   endpoint: "${MCP_ANALYTICS_ENDPOINT:https://analytics-mcp.azurecontainer.io}"
+    #   use_managed_identity: true  # Agent's MI token
+    #   managed_identity_client_id: "${ANALYTICS_MCP_CLIENT_ID}"  # Optional: user-assigned MI
+    #   audience: "api://analytics-mcp"
+    #   # Use when: MCP doesn't need user-specific permissions
+
+    # Example 2: User authentication - token passthrough (frontend user's identity)
+    # - name: "user-files-mcp"
+    #   description: "User files MCP server requiring user-scoped access"
+    #   transport: "http"
+    #   endpoint: "${MCP_USER_FILES_ENDPOINT:https://user-files-mcp.azurecontainer.io}"
+    #   use_user_token_passthrough: true  # User's token from Easy Auth
+    #   audience: "api://user-files-mcp"
+    #   # Use when: MCP needs to act as the actual user (e.g., OneDrive, SharePoint)
+    #   # Requires: Pass request to gateway.invoke_tool(..., request=request)
+
+    # Example 3: Hybrid - try user token first, fallback to managed identity
+    # - name: "hybrid-mcp"
+    #   description: "MCP server with fallback authentication"
+    #   transport: "http"
+    #   endpoint: "${MCP_HYBRID_ENDPOINT:https://hybrid-mcp.azurecontainer.io}"
+    #   use_user_token_passthrough: true  # Try user token first
+    #   use_managed_identity: true  # Fallback to MI if no user token
+    #   audience: "api://hybrid-mcp"
+    #   # Use when: Support both user-initiated and automated calls
+
+# ============================================================================
+# A2A PROTOCOL CONFIGURATION
+# ============================================================================
+
+a2a:
+  agent_card:
+    name: "Mobile Contract Agent"
+    description: "Processes mobile contacts"
+    url: "${AGENT_URL}"
+  skills:
+    - name: "analyze_data"
+      description: "Analyze data and generate insights"
+      output_type: "report"
+
+# ============================================================================
+# AUTHENTICATION CONFIGURATION
+# ============================================================================
+
+authentication:
+  enabled: false  # Set to true for production deployment
+  require_auth: false
+
+  # Paths that don't require authentication
+  public_paths:
+    - "/.well-known/agent-card.json"
+    - "/.well-known/agent.json"
+    - "/health"
+    - "/metrics"
+    - "/docs"
+    - "/openapi.json"
+
+  # User authentication via Azure Container Apps Easy Auth
+  user_auth:
+    enabled: true
+
+  # Service authentication via Bearer tokens (for Web Jobs)
+  service_auth:
+    enabled: false  # Enable in production for service-to-service calls
+    tenant_id: "${AZURE_TENANT_ID:00000000-0000-0000-0000-000000000000}"
+    client_id: "${AZURE_CLIENT_ID:00000000-0000-0000-0000-000000000000}"
+    audience: "${AZURE_CLIENT_ID:00000000-0000-0000-0000-000000000000}"  # Defaults to client_id
+
+    # Optional: Restrict to specific service principals (leave empty to allow all)
+    allowed_service_principals: []
+      # - "${WEB_JOB_MANAGED_IDENTITY_OID}"
+
+# ============================================================================
+# SERVER CONFIGURATION
+# ============================================================================
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  log_level: "info"
+  max_request_size_mb: 250  # Allow up to 250 MB file uploads

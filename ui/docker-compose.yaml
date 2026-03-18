@@ -1,0 +1,18 @@
+services:
+  a2a-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - '3001:3000'
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_APP_NAME=A2A UI
+      - NEXT_PUBLIC_APP_VERSION=1.0.0
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/api/health', (res) => process.exit(res.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

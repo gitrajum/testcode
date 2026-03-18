@@ -1,0 +1,24 @@
+# Publish API specification and documenation to MuleSoft AnyPoint Exchange Catalog.
+# The catalog is available at https://go.cnb/mulesoft -> Exchange
+name: Publish API Spec
+run-name: Publish ${{ inputs.config }}
+
+on:
+  workflow_dispatch:
+    inputs:
+        config:
+          type: choice
+          description: 'Which catalog asset do you want to publish?'
+          options:
+          - configuration/api-gateway/config.json
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  catalog:
+    name: Deploy Catalog Item
+    uses: bayer-int/mulesoft-actions/.github/workflows/deploy-catalog-item.yml@v5
+    with:
+      config-path: ${{ inputs.config }}

@@ -1,0 +1,74 @@
+[project]
+name = "mobile-contract-agent-agent"
+version = "0.1.0"
+description = "A AI agent based on the phased-orchestrator template"
+authors = [
+    { name = "Jeel Soni", email = "jeel.soni@bayer.com" }
+]
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+dependencies = [
+    "agentic-ai-sdk[microsoft,a2a,cosmosdb,observability]>=1.0.0rc1",
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "pdfplumber>=0.10.0",
+    "pandas>=2.0.0",
+    "openpyxl>=3.1.0",
+    "pydantic>=2.0.0",
+    "databricks-sql-connector>=3.0.0",
+    "phonenumbers>=8.13.0",
+    "azure-data-tables>=12.5.0",
+    "azure-identity>=1.15.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "black>=24.0.0",
+    "ruff>=0.3.0",
+    "mypy>=1.8.0",
+    "debugpy>=1.8.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["a2a_server", "tools"]
+
+[tool.setuptools.package-data]
+"*" = ["configs/*.yaml"]
+
+[project.scripts]
+mobile-contract-agent = "mobile_contract_agent.a2a_server:main"
+mobile-contract-agent-cli = "cli.main:main"
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --cov=. --cov-report=term-missing"

@@ -1,0 +1,31 @@
+# Delete API specification and documenation from MuleSoft AnyPoint Exchange Catalog.
+# Run it if you are going to decommission your API Gateway.
+name: Delete API Spec
+run-name: Delete ${{ inputs.config }}
+
+on:
+  workflow_dispatch:
+    inputs:
+        config:
+          type: choice
+          description: 'Which config json to deploy'
+          options:
+          - configuration/api-gateway/config.json
+        scope:
+          type: choice
+          description: 'What should be deleted?'
+          options:
+          - 'Single Version'
+          - 'Complete Asset'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  catalog:
+    name: Delete Catalog Item
+    uses: bayer-int/mulesoft-actions/.github/workflows/delete-catalog-item.yml@v5
+    with:
+      config-path: ${{ inputs.config }}
+      scope: ${{ inputs.scope }}

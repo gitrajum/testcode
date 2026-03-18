@@ -1,0 +1,46 @@
+@keyframes flowAnimation {
+    0% { opacity: 0.3; }
+    50% { opacity: 1; }
+    100% { opacity: 0.3; }
+}
+
+.connectionGroup:hover path {
+    filter: drop-shadow(0 0 8px rgba(79, 70, 229, 0.4));
+}
+
+.connectionGroup:hover .flowDot {
+    opacity: 1;
+}
+
+.flowDot {
+    transition: all 0.3s ease;
+}
+
+.flowAnimation {
+    animation: flowAnimation 3s ease-in-out infinite;
+}
+
+.flowAnimationFast {
+    animation: flowAnimation 2s ease-in-out infinite;
+}
+
+.connectionGroup {
+    transition: all 0.3s ease;
+}
+
+.nodeGroup {
+    transition: all 0.3s ease;
+    cursor: pointer;
+}
+
+.nodeGroup:hover {
+    filter: drop-shadow(0 4px 8px rgba(0, 0, 0, 0.2));
+}
+
+.sessionNode {
+    filter: drop-shadow(0 2px 4px rgba(245, 158, 11, 0.3));
+}
+
+.selectedNode {
+    filter: drop-shadow(0 4px 12px rgba(59, 130, 246, 0.4));
+}

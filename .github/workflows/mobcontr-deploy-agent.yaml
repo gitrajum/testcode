@@ -1,0 +1,313 @@
+name: Mobile Contract  - Deploy Agent
+
+run-name: 'Mobile Contract Agent → ${{ github.event.inputs.environment || github.ref_name }} (#${{ github.run_number }})'
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - poc
+          - test
+          - staging
+          - prod
+        default: poc
+      version:
+        description: 'Image version tag'
+        required: false
+        type: string
+        default: 'latest'
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: string
+      version:
+        description: 'Image version tag'
+        required: false
+        type: string
+        default: 'latest'
+      skip_acr_access_toggle:
+        description: 'Skip ACR public access enable/disable (used when called from deploy-all)'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      SDK_ACCESS_TOKEN:
+        required: true
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+      GH_PAT_MODULES:
+        required: true
+
+
+env:
+  # Azure credentials for OIDC authentication
+  AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID || secrets.AZURE_CLIENT_ID }}
+  AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID || secrets.AZURE_TENANT_ID }}
+  AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID || secrets.AZURE_SUBSCRIPTION_ID }}
+  # For manual runs, use input; for push events, derive from branch name
+  ENV_NAME: ${{ github.event.inputs.environment || github.ref_name }}
+  IMAGE_NAME: mobcontr-agent
+  DOCKERFILE_PATH: af_agentcell_004/agents/mobile-contract-agent//Dockerfile
+  BUILD_CONTEXT: af_agentcell_004/agents/mobile-contract-agent
+  # DOCKERFILE_PATH: af_agentcell_004/streamlit/Dockerfile
+  # BUILD_CONTEXT: af_agentcell_004/streamlit
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_TF_RG_NAME || secrets.AZURE_TF_RG_NAME }}
+  CONTAINER_APP_AGENT: "ca-agent-mobcontr-${{ github.event.inputs.environment || github.ref_name }}-gwc"
+  CONTAINER_REGISTRY: "acrmobcontr${{ github.event.inputs.environment || github.ref_name }}.azurecr.io"
+  REGISTRY_NAME: "acrmobcontr${{ github.event.inputs.environment || github.ref_name }}"
+
+jobs:
+  build-and-deploy:
+    # Use GitHub-hosted runner - simpler than self-hosted
+    # ACR needs temporary public access for the build anyway (ACR Tasks limitation)
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || github.ref_name }}
+    permissions:
+      contents: read
+      id-token: write # Needed for federated identity login to Azure
+
+    steps:
+      - name: Checkout Mobile Contract repo
+        uses: actions/checkout@v4
+        with:
+          path: af_agentcell_004
+
+      - name: Checkout SDK repo
+        uses: actions/checkout@v4
+        with:
+          repository: bayer-int/agentic_ai_sdk
+          path: agentic_ai_sdk
+          token: ${{ secrets.SDK_ACCESS_TOKEN }}
+
+      - name: Set version tag
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ] && [ "${{ github.event.inputs.version }}" != "latest" ]; then
+            # Use manually provided version
+            VERSION_TAG="${{ github.event.inputs.version }}"
+            echo "Using manual version: ${VERSION_TAG}"
+          else
+            # Date + short SHA + run id format: 2026.01.28-1a2b3c4-123456789
+            SHORT_SHA="${GITHUB_SHA::7}"
+            VERSION_TAG="$(date +%Y.%m.%d)-${SHORT_SHA}-${{ github.run_id }}"
+            echo "Generated version: ${VERSION_TAG}"
+          fi
+          echo "VERSION=${VERSION_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Export ARM credentials for Terraform
+        shell: bash
+        env:
+          ARM_CLIENT_ID: ${{ env.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ env.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ env.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: "true"
+        run: |
+          {
+            echo "ARM_CLIENT_ID=$ARM_CLIENT_ID"
+            echo "ARM_TENANT_ID=$ARM_TENANT_ID"
+            echo "ARM_SUBSCRIPTION_ID=$ARM_SUBSCRIPTION_ID"
+            echo "ARM_USE_OIDC=$ARM_USE_OIDC"
+          } >> "$GITHUB_ENV"
+
+      - name: Set Azure Subscription
+        run: |
+          az account set --subscription "${{ env.AZURE_SUBSCRIPTION_ID }}"
+          az account show
+
+      # Build using Kaniko (rootless container builder)
+      # ACR Tasks won't work because ACR is network-isolated and ACR Tasks uses public IPs
+      # Kaniko runs locally on the runner and pushes via the VNet's private endpoint
+
+      - name: Validate Azure Targets
+        run: |
+          set -e
+          echo "AZURE_SUBSCRIPTION_ID=${{ env.AZURE_SUBSCRIPTION_ID }}"
+          echo "AZURE_RESOURCE_GROUP=${{ env.AZURE_RESOURCE_GROUP }}"
+          echo "CONTAINER_APP_AGENT=${{ env.CONTAINER_APP_AGENT }}"
+          echo "CONTAINER_REGISTRY=${{ env.CONTAINER_REGISTRY }}"
+          if [ -z "${{ env.CONTAINER_APP_AGENT }}" ]; then echo "Missing CONTAINER_APP_AGENT"; exit 1; fi
+          if [ -z "${{ env.AZURE_RESOURCE_GROUP }}" ]; then echo "Missing AZURE_RESOURCE_GROUP"; exit 1; fi
+          az group show -n "${{ env.AZURE_RESOURCE_GROUP }}" 1>/dev/null
+          echo "Validating container app exists..."
+          az containerapp show \
+            --name "${{ env.CONTAINER_APP_AGENT }}" \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --subscription "${{ env.AZURE_SUBSCRIPTION_ID }}" -o table
+
+      - name: Temporarily Enable ACR Public Access
+        if: ${{ inputs.skip_acr_access_toggle != true }}
+        run: |
+          # ACR Tasks runs on Microsoft-hosted agents with public IPs
+          # We need to temporarily enable public access for the build
+          echo "Temporarily enabling public access for ACR build..."
+
+          # Enable public network access and set default action to Allow
+          az acr update \
+            --name "${{ env.REGISTRY_NAME }}" \
+            --public-network-enabled true \
+            --default-action Allow
+
+          # Wait and verify the change took effect
+          echo "Waiting for ACR configuration to propagate..."
+          for i in {1..12}; do
+            sleep 10
+            STATUS=$(az acr show --name "${{ env.REGISTRY_NAME }}" --query "publicNetworkAccess" -o tsv)
+            echo "Attempt $i: Public network access = $STATUS"
+            if [ "$STATUS" == "Enabled" ]; then
+              echo "✅ Public access confirmed enabled"
+              break
+            fi
+          done
+
+          # Extra buffer for DNS/network propagation
+          sleep 15
+
+      - name: Unlock Latest Tag (if exists)
+        continue-on-error: true
+        run: |
+          # Unlock 'latest' tag if it exists so we can overwrite it
+          az acr repository update \
+            --name "${{ env.REGISTRY_NAME }}" \
+            --image "${{ env.IMAGE_NAME }}:latest" \
+            --write-enabled true \
+            --delete-enabled true 2>/dev/null || echo "No existing latest tag to unlock"
+
+      - name: Verify Directory Structure
+        run: |
+          echo "=== Current directory ==="
+          pwd
+          echo ""
+          echo "=== Workspace contents ==="
+          ls -la
+          echo ""
+          echo "=== af_agentcell_004 exists? ==="
+          [ -d "af_agentcell_004" ] && echo "✅ YES" || echo "❌ NO"
+          echo ""
+          echo "=== agentic_ai_sdk exists? ==="
+          [ -d "agentic_ai_sdk" ] && echo "✅ YES" || echo "❌ NO"
+          echo ""
+          echo "=== Dockerfile location ==="
+          [ -f "${{ env.DOCKERFILE_PATH }}" ] && echo "✅ Found at ${{ env.DOCKERFILE_PATH }}" || echo "❌ NOT FOUND"
+          echo ""
+          echo "=== SDK contents (first level) ==="
+          ls -la agentic_ai_sdk/ || echo "SDK directory not accessible"
+
+      - name: Build and Push Image with ACR Tasks
+        id: build
+        run: |
+          # Use ACR Tasks to build the image
+          # az acr build uses the Azure CLI login (OIDC) - no separate token needed
+          echo "Building image using ACR Tasks..."
+          echo "  Registry: ${{ env.REGISTRY_NAME }}"
+          echo "  Image: ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}"
+          echo "  Build Context: . (workspace root - contains both repos)"
+          echo "  Dockerfile: ${{ env.DOCKERFILE_PATH }}"
+          # Note: ACR build logs are shown in plain format by default (equivalent to Docker's --progress=plain)
+          # Adding --debug for verbose output including ACR Tasks details
+          # Build context is "." (workspace root) so Docker can access both af_agentcell_004 and agentic_ai_sdk
+          az acr build \
+            --registry "${{ env.REGISTRY_NAME }}" \
+            --image "${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}" \
+            --image "${{ env.IMAGE_NAME }}:latest" \
+            --platform linux/amd64 \
+            --file "${{ env.DOCKERFILE_PATH }}" \
+            .
+
+          # Build args not needed - using local SDK from workspace
+          # --secret-build-arg ARTIFACTORY_USER_NAME_SDK="${{ vars.ARTIFACTORY_USER_NAME_SDK }}"
+          # --secret-build-arg ARTIFACTORY_USER_TOKEN_SDK="${{ secrets.ARTIFACTORY_USER_TOKEN_SDK }}"
+          # --secret-build-arg GH_PAT_MODULES="${{ secrets.GH_PAT_MODULES }}"
+
+          echo "✅ Image built and pushed successfully"
+
+      - name: Disable ACR Public Access
+        # if: ${{ always() && inputs.skip_acr_access_toggle != true }}
+        if: false # Keep ACR public access enabled for Container Apps to pull images
+        run: |
+          # Always disable public access, even if build failed
+          echo "Disabling ACR public access..."
+          az acr update \
+            --name "${{ env.REGISTRY_NAME }}" \
+            --public_network_enabled false \
+            --default-action Deny
+          echo "✅ ACR public access disabled"
+
+      - name: Lock Version Tag (Make Immutable)
+        continue-on-error: true
+        run: |
+          az acr repository update \
+            --name "${{ env.REGISTRY_NAME }}" \
+            --image "${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}" \
+            --write-enabled false \
+            --delete-enabled false || echo "⚠️ Could not lock version tag (insufficient permissions) — non-fatal"
+
+      - name: Lock Latest Tag
+        continue-on-error: true
+        run: |
+          az acr repository update \
+            --name "${{ env.REGISTRY_NAME }}" \
+            --image "${{ env.IMAGE_NAME }}:latest" \
+            --write-enabled false \
+            --delete-enabled false || echo "⚠️ Could not lock latest tag (insufficient permissions) — non-fatal"
+
+      - name: Ensure ACR Public Access Enabled for Container Apps
+        run: |
+          # Container Apps needs ACR public access to pull images (no private endpoint configured)
+          echo "Ensuring ACR public access is enabled for Container Apps..."
+          az acr update \
+            --name "${{ env.REGISTRY_NAME }}" \
+            --public-network-enabled true \
+            --default-action Allow
+          echo "✅ ACR public access enabled"
+
+      - name: Verify ACR Pull Role Assignment
+        run: |
+          echo "Verifying managed identity has AcrPull role on ACR..."
+          ACR_ID=$(az acr show --name "${{ env.REGISTRY_NAME }}" --query id -o tsv)
+          MI_NAME="mi-acr-pull-mobcontr-${{ github.event.inputs.environment || github.ref_name }}-gwc"
+
+          echo "ACR Resource ID: $ACR_ID"
+          echo "Managed Identity: $MI_NAME"
+
+          # List role assignments
+          az role assignment list \
+            --scope "$ACR_ID" \
+            --query "[?principalType=='ServicePrincipal' && roleDefinitionName=='AcrPull'].{Principal:principalId, Role:roleDefinitionName}" \
+            -o table
+
+          echo "✅ Role verification complete"
+
+      # Registry is configured by Terraform with user-assigned identity - no manual step needed
+      - name: Update Container App with New Image
+        run: |
+          az containerapp revision copy \
+            --name "${{ env.CONTAINER_APP_AGENT }}" \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --image "${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}"
+
+      - name: Deployment Summary
+        run: |
+          echo "### Deployment Summary (Mobile Contract Agent)" >> $GITHUB_STEP_SUMMARY
+          echo "- Environment: ${{ github.event.inputs.environment || github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Subscription: ${{ env.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Resource Group: ${{ env.AZURE_RESOURCE_GROUP }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Container App: ${{ env.CONTAINER_APP_AGENT }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: ${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}" >> $GITHUB_STEP_SUMMARY

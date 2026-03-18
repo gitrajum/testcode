@@ -1,0 +1,210 @@
+name: Mobile Contract - Deploy Email MCP
+
+run-name: 'Mobile Contract Email MCP → ${{ github.event.inputs.environment || github.ref_name }} (#${{ github.run_number }})'
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - poc
+          - dev
+          - test
+          - staging
+          - prod
+        default: poc
+      version:
+        description: Version tag for the image
+        required: true
+        default: latest
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: string
+      version:
+        description: 'Image version tag'
+        required: false
+        type: string
+        default: 'latest'
+    secrets:
+      SDK_ACCESS_TOKEN:
+        required: true
+      AZURE_CREDENTIALS:
+        required: true
+      AZURE_COMMUNICATION_CONNECTION_STRING:
+        required: true
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+  push:
+    branches:
+      - dev
+      - test
+      - staging
+      - prod
+    paths:
+      - 'mcps/email-mcp/**'
+      - '.github/workflows/deferls-deploy-email-mcp.yml'
+
+env:
+  AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  # For manual runs, use input; for push events, derive from branch name
+  ENV_NAME: ${{ github.event.inputs.environment || github.ref_name }}
+  IMAGE_NAME: email-mcp
+  DOCKERFILE_PATH: af_agentcell_004/mcps/email-mcp/Dockerfile
+  BUILD_CONTEXT: .
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_TF_RG_NAME }}
+  CONTAINER_APP_EMAIL_MCP: "ca-emailmcp-mobcontr-${{ github.event.inputs.environment || github.ref_name }}-gwc"
+  CONTAINER_REGISTRY: "acrmobcontr${{ github.event.inputs.environment || github.ref_name }}.azurecr.io"
+  REGISTRY_NAME: "acrmobcontr${{ github.event.inputs.environment || github.ref_name }}"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: poc
+
+    # Required for OIDC authentication with Azure
+    permissions:
+      id-token: write      # Required to request OIDC token for Azure login
+      contents: read       # Required to checkout code
+
+    steps:
+      - name: Checkout actuals repo
+        uses: actions/checkout@v4
+        with:
+          path: af_agentcell_004
+
+      - name: Checkout SDK repo
+        uses: actions/checkout@v4
+        with:
+          repository: bayer-int/agentic_ai_sdk
+          path: agentic_ai_sdk
+          token: ${{ secrets.SDK_ACCESS_TOKEN }}
+
+      - name: Set version tag
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ] && [ "${{ github.event.inputs.version }}" != "latest" ]; then
+            VERSION_TAG="${{ github.event.inputs.version }}"
+            echo "Using manual version: ${VERSION_TAG}"
+          else
+            SHORT_SHA="${GITHUB_SHA::7}"
+            VERSION_TAG="$(date +%Y.%m.%d)-${SHORT_SHA}-${{ github.run_id }}"
+            echo "Generated version: ${VERSION_TAG}"
+          fi
+          echo "VERSION=${VERSION_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set Azure Subscription
+        run: |
+          az account set --subscription "${{ env.AZURE_SUBSCRIPTION_ID }}"
+          az account show
+
+      - name: ACR Login
+        run: |
+          az acr login --name "${{ env.CONTAINER_REGISTRY }}"
+
+      - name: Validate Azure Targets
+        run: |
+          set -e
+          echo "AZURE_SUBSCRIPTION_ID=${{ env.AZURE_SUBSCRIPTION_ID }}"
+          echo "AZURE_RESOURCE_GROUP=${{ env.AZURE_RESOURCE_GROUP }}"
+          echo "CONTAINER_APP_EMAIL_MCP=${{ env.CONTAINER_APP_EMAIL_MCP }}"
+          echo "CONTAINER_REGISTRY=${{ env.CONTAINER_REGISTRY }}"
+          if [ -z "${{ env.CONTAINER_APP_EMAIL_MCP }}" ]; then echo "Missing CONTAINER_APP_EMAIL_MCP"; exit 1; fi
+          if [ -z "${{ env.AZURE_RESOURCE_GROUP }}" ]; then echo "Missing AZURE_RESOURCE_GROUP"; exit 1; fi
+          az group show -n "${{ env.AZURE_RESOURCE_GROUP }}" 1>/dev/null
+          echo "Validating container app exists..."
+          az containerapp show \
+            --name "${{ env.CONTAINER_APP_EMAIL_MCP }}" \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --subscription "${{ env.AZURE_SUBSCRIPTION_ID }}" -o table
+
+
+      - name: Unlock Latest Tag (if exists)
+        continue-on-error: true
+        run: |
+          az acr repository update \
+            --name "${{ env.REGISTRY_NAME }}" \
+            --image "${{ env.IMAGE_NAME }}:latest" \
+            --write-enabled true \
+            --delete-enabled true 2>/dev/null || echo "No existing latest tag to unlock"
+
+      - name: Build Docker Image
+        run: |
+          docker build \
+            --tag "${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}" \
+            --tag "${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest" \
+            --file "${{ env.DOCKERFILE_PATH }}" \
+            "${{ env.BUILD_CONTEXT }}"
+
+      - name: Push Docker Image
+        run: |
+          set -e
+          docker push "${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}"
+          docker push "${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+
+      - name: Lock Version Tag (Make Immutable)
+        run: |
+          az acr repository update \
+            --name "${{ env.REGISTRY_NAME }}" \
+            --image "${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}" \
+            --write-enabled false \
+            --delete-enabled false
+
+      - name: Lock Latest Tag
+        run: |
+          az acr repository update \
+            --name "${{ env.REGISTRY_NAME }}" \
+            --image "${{ env.IMAGE_NAME }}:latest" \
+            --write-enabled false \
+            --delete-enabled false
+
+      # Registry is configured by Terraform with user-assigned identity - no manual step needed
+      # Update Azure Communication Service parameters
+      - name: Update Azure Communication Service secrets
+        run: |
+          # Store secrets securely in Container App's secret store
+          az containerapp secret set \
+            --name "${{ env.CONTAINER_APP_EMAIL_MCP }}" \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --secrets \
+              azure-comm-connection-string="${{ secrets.AZURE_COMMUNICATION_CONNECTION_STRING }}"
+
+          # Reference secrets in environment variables
+          az containerapp update \
+            --name "${{ env.CONTAINER_APP_EMAIL_MCP }}" \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --set-env-vars \
+              AZURE_COMMUNICATION_CONNECTION_STRING=secretref:azure-comm-connection-string \
+              AZURE_EMAIL_DOMAIN="${{ vars.AZURE_EMAIL_DOMAIN }}"
+
+      - name: Update Container App with New Image
+        run: |
+          az containerapp revision copy \
+            --name "${{ env.CONTAINER_APP_EMAIL_MCP }}" \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --image "${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}"
+
+      - name: Deployment Summary
+        run: |
+          echo "### Deployment Summary (Deferrals Email MCP)" >> $GITHUB_STEP_SUMMARY
+          echo "- Environment: Deferrals" >> $GITHUB_STEP_SUMMARY
+          echo "- Subscription: ${{ env.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Resource Group: ${{ env.AZURE_RESOURCE_GROUP }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Container App: ${{ env.CONTAINER_APP_EMAIL_MCP }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: ${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}" >> $GITHUB_STEP_SUMMARY

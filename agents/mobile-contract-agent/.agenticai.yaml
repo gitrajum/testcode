@@ -1,0 +1,42 @@
+# Agent Configuration for Agentic AI CLI
+
+agent:
+  name: "mobile-contract-agent"
+  version: "0.1.0"
+  description: "A AI agent based on the phased-orchestrator template"
+
+paths:
+  entry: "src/a2a_server.py"
+  tools: "src/tools"
+  configs: "configs"
+  default_config: "configs/config.yaml"
+
+runtime:
+  port: 8000
+  debug_port: 5678
+  default_mode: "local"
+  env_file: ".env.development"
+
+development:
+  hot_reload: true
+  debug: true
+  sdk_editable: false
+  watch_paths:
+    - "tools"
+    - "configs"
+    - "."
+  watch_patterns:
+    - "*.py"
+    - "*.yaml"
+
+  sdk:
+    enabled: true
+    auto_detect: true
+    extras:
+      - "microsoft"
+      - "a2a"
+
+docker:
+  image_name: "mobile-contract-agent"
+  tag: "latest"
+  dockerfile: "Dockerfile"
