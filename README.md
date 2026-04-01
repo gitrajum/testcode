@@ -7,3 +7,7 @@ https://github.com/bayer-int/af_agentcell_003/tree/poc/mcps/grafana-mcp-server
 
 
 https://bayerplayground.grafana.net/a/grafana-metricsdrilldown-app/drilldown?actionView=breakdown&var-filters=&layout=grid&filters-rule=&filters-prefix=&filters-suffix=&var-metrics_filters=&search_txt=zbx_system_cpu&var-metrics-reducer-sort-by=default&filters-recent=&var-ds=cfcem6iqbegw0d&var-labelsWingman=%28none%29&var-other_metric_filters=
+
+sharpoint link:
+
+https://bayergroupcan.sharepoint.com/:f:/r/sites/AgenticFoundation/Shared%20Documents/General/004%20DevOps%20%26%20Transformation/DevOps/MVP6?csf=1&web=1&e=zFShVS
