@@ -40,7 +40,6 @@ agents/.DS_Store
 .DS_Store
 
 # Large files / installers
-*.zip
 *.exe
 *.tar.gz
 *.tar
