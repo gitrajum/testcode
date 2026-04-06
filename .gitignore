@@ -38,3 +38,18 @@ github_conf/
 ui/package-lock.json
 agents/.DS_Store
 .DS_Store
+
+# Large files / installers
+*.zip
+*.exe
+*.tar.gz
+*.tar
+*.gz
+*.rar
+*.7z
+*.iso
+*.dmg
+*.pkg
+*.msi
+*.deb
+*.rpm
